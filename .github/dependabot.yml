@@ -1,0 +1,8 @@
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  # Add a "swift" entry alongside the first Package.swift. Until then the swift
+  # updater has nothing to read and fails every week.

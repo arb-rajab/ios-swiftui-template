@@ -1,0 +1,205 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege by default; the jobs that need more (CodeQL's upload to
+# code scanning) ask for it individually.
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    # Keep this name identical to the job id: if branch protection requires a
+    # status check with this exact name, renaming it leaves the check unreported
+    # and blocks every merge.
+    name: build-and-test
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select the newest available Xcode
+        # The default /Applications/Xcode.app can be older than the project
+        # format XcodeGen writes ("in a future Xcode project file format").
+        # Runner images ship several Xcodes side by side, so pick the newest.
+        run: |
+          LATEST=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n1)
+          if [ -z "$LATEST" ]; then
+            LATEST=/Applications/Xcode.app
+          fi
+          echo "Selecting $LATEST"
+          sudo xcode-select -switch "$LATEST"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Pick an available iPhone simulator
+        id: sim
+        # Two failure modes this avoids:
+        # 1. Picking a device name via `simctl` without its paired OS can name a
+        #    device that only exists on older iOS runtimes, which then fails to
+        #    resolve against xcodebuild's implicit `OS:latest`.
+        # 2. `xcodebuild -showdestinations` right after an `xcode-select -switch`
+        #    can report an incomplete device list (a cold CoreSimulator cache).
+        #    So: use `simctl`'s own JSON output (`jq`, preinstalled on GitHub's
+        #    macOS runners) and keep name+OS paired from the same device entry.
+        run: |
+          set +e
+          BEST=$(xcrun simctl list devices available -j | jq -r '
+            [
+              .devices
+              | to_entries[]
+              | select(.key | startswith("com.apple.CoreSimulator.SimRuntime.iOS-"))
+              | .key as $runtime
+              | ($runtime | sub("com.apple.CoreSimulator.SimRuntime.iOS-"; "") | split("-") | map(tonumber)) as $ver
+              | .value[]
+              | select(.isAvailable and (.name | startswith("iPhone")))
+              | { name: .name, os: ($ver | join(".")), ver: $ver }
+            ]
+            | sort_by(.ver)
+            | last
+            | if . == null then empty else "\(.name)|\(.os)" end
+          ')
+
+          if [ -z "$BEST" ]; then
+            echo "No available iPhone simulator found" >&2
+            xcrun simctl list devices available
+            exit 1
+          fi
+
+          NAME="${BEST%%|*}"
+          OS="${BEST##*|}"
+          echo "Selected: name=$NAME OS=$OS"
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "os=$OS" >> "$GITHUB_OUTPUT"
+
+      # Signing uses project.yml's CODE_SIGN_IDENTITY=- (ad-hoc). Don't pass
+      # CODE_SIGNING_ALLOWED=NO here: it would override the project setting back
+      # to unsigned, and the Keychain tests then fail with errSecMissingEntitlement.
+      - name: Build
+        run: |
+          xcodebuild build \
+            -project StarterAppIOS.xcodeproj \
+            -scheme StarterAppIOS \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }},OS=${{ steps.sim.outputs.os }}"
+
+      - name: Test
+        run: |
+          set -o pipefail
+          xcodebuild test \
+            -project StarterAppIOS.xcodeproj \
+            -scheme StarterAppIOS \
+            -destination "platform=iOS Simulator,name=${{ steps.sim.outputs.name }},OS=${{ steps.sim.outputs.os }}"
+
+  secret-scan:
+    name: Secret scan (gitleaks)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history so gitleaks can scan every commit in the push/PR
+          # range, not just the tip - a secret committed and then removed
+          # is still leaked.
+          fetch-depth: 0
+
+      # The action runs the gitleaks binary; it needs no license for
+      # repositories owned by a personal account (only organizations).
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  codeql:
+    name: CodeQL (Swift)
+    # CodeQL's Swift support only runs on macOS. This is a separate job
+    # rather than steps added to build-and-test so that (a) the
+    # `security-events: write` permission is scoped to this job alone,
+    # (b) a code-scanning problem (e.g. the setting being unavailable)
+    # cannot mask or fail the build/test result, and (c) it runs in
+    # parallel. The cost is one extra Xcode build; it uses a generic
+    # Simulator destination, so it needs no Simulator-picking step.
+    runs-on: macos-15
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Select the newest available Xcode
+        # Same reasoning as in build-and-test above.
+        run: |
+          LATEST=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -n1)
+          if [ -z "$LATEST" ]; then
+            LATEST=/Applications/Xcode.app
+          fi
+          echo "Selecting $LATEST"
+          sudo xcode-select -switch "$LATEST"
+          xcodebuild -version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: swift
+          build-mode: manual
+
+      # CodeQL traces this build to extract the Swift sources, so it must
+      # be a real, from-scratch compile of the app (not a cached one).
+      - name: Build
+        run: |
+          xcodebuild build \
+            -project StarterAppIOS.xcodeproj \
+            -scheme StarterAppIOS \
+            -sdk iphonesimulator \
+            -destination "generic/platform=iOS Simulator"
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:swift"
+
+  # CodeQL for this repo's own GitHub Actions workflows (injection via
+  # untrusted event data, over-broad token permissions, unsafe checkouts).
+  # A separate job so the existing CodeQL job and its required check name
+  # stay unchanged; GitHub's required `CodeQL` check gates its alerts too.
+  codeql-actions:
+    name: CodeQL (actions)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+      actions: read
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: github/codeql-action/init@v4
+        with:
+          languages: actions
+          build-mode: none
+
+      - uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:actions"
