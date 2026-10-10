@@ -40,4 +40,4 @@ for p in $(find Sources Tests -depth -name '*StarterApp*'); do
 done
 
 echo "Renamed to ${NAME} (${BUNDLE_ID}). Then run (on macOS): brew install xcodegen && xcodegen generate"
-echo "Fill in LICENSE ([YEAR] [COPYRIGHT HOLDER]) and delete this script when done."
+echo "Update the copyright line in LICENSE for your project and delete this script when done."
